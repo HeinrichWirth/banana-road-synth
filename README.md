@@ -11,7 +11,7 @@ when real labeled data is scarce or domain-specific.
 
 ---
 
-## Examplew
+## Examples
 ### Before
 ![before_1](assets/before_1.png)
 ![before_2](assets/before_2.png)
