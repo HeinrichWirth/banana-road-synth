@@ -22,6 +22,11 @@ when real labeled data is scarce or domain-specific.
 ![after_2](assets/after_2.png)
 ![after_3](assets/after_3.png)
 
+### Overlay masks
+![overlay_1](assets/overlay_1.png)
+![overlay_2](assets/overlay_2.png)
+![overlay_3](assets/overlay_3.png)
+
 ---
 
 ## What this repository contains
