@@ -12,12 +12,12 @@ when real labeled data is scarce or domain-specific.
 ---
 
 ## Examplew
-Before
+### Before
 ![before_1](assets/before_1.png)
 ![before_2](assets/before_2.png)
 ![before_3](assets/before_3.png)
 
-After
+### After
 ![after_1](assets/after_1.png)
 ![after_2](assets/after_2.png)
 ![after_3](assets/after_3.png)
