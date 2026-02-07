@@ -11,24 +11,6 @@ when real labeled data is scarce or domain-specific.
 
 ---
 
-## Examples
-### Before
-![before_1](assets/before_1.png)
-![before_2](assets/before_2.png)
-![before_3](assets/before_3.png)
-
-### After
-![after_1](assets/after_1.png)
-![after_2](assets/after_2.png)
-![after_3](assets/after_3.png)
-
-### Overlay masks
-![overlay_1](assets/overlay_1.png)
-![overlay_2](assets/overlay_2.png)
-![overlay_3](assets/overlay_3.png)
-
----
-
 ## What this repository contains
 
 A single script that processes a folder of road images and produces:
@@ -119,6 +101,24 @@ The model may:
 - confuse curbs, barriers, and parapets
 - hallucinate traffic signs
 - misinterpret shadows
+
+---
+
+## Examples
+### Before
+![before_1](assets/before_1.png)
+![before_2](assets/before_2.png)
+![before_3](assets/before_3.png)
+
+### After
+![after_1](assets/after_1.png)
+![after_2](assets/after_2.png)
+![after_3](assets/after_3.png)
+
+### Overlay masks
+![overlay_1](assets/overlay_1.png)
+![overlay_2](assets/overlay_2.png)
+![overlay_3](assets/overlay_3.png)
 
 ---
 
