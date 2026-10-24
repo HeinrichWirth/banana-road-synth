@@ -1,15 +1,12 @@
-# API Key and model
-GEMINI_API_KEY = "key_api"
-MODEL = "gemini-3-pro-image-preview"
+import os
+
+# Credentials stay outside version control. The original experiment used
+# gemini-3-pro-image-preview; the current stable model is configurable here.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-pro-image")
 
 # path photo
-INPUT_DIR = "path"
-
-OUT_MASKS_NAME = "out_masks"
-OUT_PATCHED_NAME = "out_patches"
-OUT_EVENING_NAME = "out_evening"
-OUT_OVERLAY_NAME = "out_overlay"
-OUT_SEMSEG_NAME = "out_semseg"
+INPUT_DIR = "input_images"
 
 #prompts
 MASK_PROMPT = """Generate a binary segmentation mask of asphalt road repair patches.

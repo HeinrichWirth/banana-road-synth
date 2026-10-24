@@ -1,243 +1,191 @@
-import os
-import io
+"""Generate road-patch candidates; inspect every pair before using it as a label."""
+import argparse
 import base64
+import hashlib
+import io
+import json
 from pathlib import Path
 
 import numpy as np
-from PIL import Image as PILImage
-from tqdm.auto import tqdm
+from PIL import Image, ImageOps
 
-from google import genai
-
-from config import (
-    GEMINI_API_KEY,
-    MODEL,
-    INPUT_DIR,
-    OUT_MASKS_NAME,
-    OUT_PATCHED_NAME,
-    OUT_EVENING_NAME,
-    OUT_OVERLAY_NAME,
-    OUT_SEMSEG_NAME,
-    MASK_PROMPT,
-    PATCH_PROMPT,
-    EVENING_PROMPT,
-    SEMSEG_PROMPT,
-)
-
+import config
 
 EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+PALETTE = np.array([[0, 0, 0], [0, 0, 255], [0, 255, 0],
+                    [255, 0, 0], [255, 255, 255]], dtype=np.int32)
 
 
 def response_last_image_as_pil(response):
-    last_img = None
-
-    for part in response.parts:
-        if getattr(part, "inline_data", None) is None:
+    """Ignore text/thinking parts and decode the last actual image."""
+    result = None
+    for part in getattr(response, "parts", None) or []:
+        if getattr(part, "thought", False):
             continue
-
-        try:
-            img = part.as_image()
-            if hasattr(img, "convert"):
-                last_img = img
-                continue
-        except Exception:
-            img = None
-
-        blob = part.inline_data
-        data = getattr(blob, "data", None)
-
+        blob = getattr(part, "inline_data", None)
+        if blob is None or not (getattr(blob, "mime_type", "") or "").startswith("image/"):
+            continue
+        data = blob.data
         if isinstance(data, str):
-            try:
-                data = base64.b64decode(data)
-            except Exception:
-                data = None
-
-        if isinstance(data, (bytes, bytearray)):
-            last_img = PILImage.open(io.BytesIO(data))
-            continue
-
-        if img is not None:
-            for attr in ("image_bytes", "data", "bytes"):
-                b = getattr(img, attr, None)
-                if isinstance(b, str):
-                    try:
-                        b = base64.b64decode(b)
-                    except Exception:
-                        b = None
-                if isinstance(b, (bytes, bytearray)):
-                    last_img = PILImage.open(io.BytesIO(b))
-                    break
-
-    return last_img
+            data = base64.b64decode(data, validate=True)
+        with Image.open(io.BytesIO(data)) as image:
+            result = image.convert("RGB")
+    if result is None:
+        raise ValueError("The API returned no image. No output was saved for this stage.")
+    return result
 
 
-def binarize_mask(mask_img: PILImage.Image, size_wh):
-    w, h = size_wh
-    m = mask_img.convert("L").resize((w, h), PILImage.NEAREST)
-    arr = np.array(m, dtype=np.uint8)
-    arr = (arr >= 128).astype(np.uint8) * 255
-    return PILImage.fromarray(arr, mode="L")
+def binarize_mask(mask_img, size_wh):
+    mask = mask_img.convert("L").resize(size_wh, Image.Resampling.NEAREST)
+    return Image.fromarray((np.asarray(mask) >= 128).astype(np.uint8) * 255)
 
 
-def ensure_size(img: PILImage.Image, size_wh):
-    w, h = size_wh
-    if img.size == (w, h):
-        return img
-    return img.resize((w, h), PILImage.LANCZOS)
+def ensure_size(image, size_wh):
+    return image if image.size == size_wh else image.resize(size_wh, Image.Resampling.LANCZOS)
 
 
-def to_rgb(img: PILImage.Image):
-    return img.convert("RGB")
+def composite_patch(original, generated, mask):
+    """Preserve decoded RGB pixels outside the binary mask exactly."""
+    if original.size != generated.size or original.size != mask.size:
+        raise ValueError("Original, generated image and mask must have equal sizes.")
+    return Image.composite(generated.convert("RGB"), original.convert("RGB"),
+                           binarize_mask(mask, original.size))
 
 
-def overlay_mask_on_image(
-    img_rgb: PILImage.Image,
-    mask_l: PILImage.Image,
-    color=(255, 0, 0),
-    alpha=0.35,
-):
-    img = to_rgb(img_rgb)
-    m = mask_l.convert("L")
-    base = np.array(img, dtype=np.uint8)
-    mask = (np.array(m, dtype=np.uint8) >= 128)
-
-    out = base.copy().astype(np.float32)
-    c = np.array(color, dtype=np.float32).reshape(1, 1, 3)
-    out[mask] = (1.0 - alpha) * out[mask] + alpha * c
-
-    out = np.clip(out, 0, 255).astype(np.uint8)
-    return PILImage.fromarray(out, mode="RGB")
+def overlay_mask_on_image(image, mask_l, color=(255, 0, 0), alpha=0.35):
+    if not 0 <= alpha <= 1:
+        raise ValueError("alpha must be between 0 and 1")
+    if image.size != mask_l.size:
+        raise ValueError("Image and mask must have equal sizes.")
+    out = np.array(image.convert("RGB"), dtype=np.float32)
+    mask = np.asarray(mask_l.convert("L")) >= 128
+    out[mask] = (1 - alpha) * out[mask] + alpha * np.asarray(color, dtype=np.float32)
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
 
 
-_PALETTE = np.array(
-    [
-        [0, 0, 0],         # background
-        [0, 0, 255],       # curb
-        [0, 255, 0],       # road markings
-        [255, 0, 0],       # crosswalk
-        [255, 255, 255],   # sign
-    ],
-    dtype=np.int32,
-)
+def quantize_to_palette(mask_rgb, size_wh):
+    arr = np.asarray(mask_rgb.convert("RGB").resize(size_wh, Image.Resampling.NEAREST), dtype=np.int32)
+    # Work a row at a time to avoid an H*W*5*3 temporary on large images.
+    out = np.empty(arr.shape, dtype=np.uint8)
+    for y, row in enumerate(arr):
+        distances = np.sum((row[:, None, :] - PALETTE[None, :, :]) ** 2, axis=-1)
+        out[y] = PALETTE[np.argmin(distances, axis=1)]
+    return Image.fromarray(out)
 
 
-def quantize_to_palette(mask_rgb: PILImage.Image, size_wh):
-    w, h = size_wh
+def output_key(path, input_dir):
+    # Retain both the relative folder and original extension: a.jpg != a.png.
+    relative = path.relative_to(input_dir)
+    return relative.parent / (relative.name + ".png")
 
-    m = to_rgb(mask_rgb).resize((w, h), PILImage.NEAREST)
 
-    arr = np.array(m, dtype=np.int32)
+def discover_inputs(input_dir, output_dir):
+    root, out = input_dir.resolve(), output_dir.resolve()
+    if not root.is_dir():
+        raise ValueError(f"Input directory does not exist: {root}")
+    if root == out or root.is_relative_to(out):
+        raise ValueError("The output directory must not contain the input directory.")
+    paths = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in EXTS
+                   and not p.resolve().is_relative_to(out))
+    if not paths:
+        raise ValueError(f"No images found in {root}")
+    return paths
 
-    flat = arr.reshape(-1, 3)[:, None, :]
-    pal = _PALETTE[None, :, :]
 
-    d2 = np.sum((flat - pal) ** 2, axis=-1)
-    idx = np.argmin(d2, axis=1)
+def save_image(image, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    image.save(temporary, format="PNG")
+    temporary.replace(path)
 
-    out = _PALETTE[idx].astype(np.uint8).reshape(h, w, 3)
 
-    return PILImage.fromarray(out, mode="RGB")
+def load_rgb(path):
+    with Image.open(path) as image:
+        return ImageOps.exif_transpose(image).convert("RGB")
+
+
+def process_image(path, input_dir, output_dir, generate_image, *, evening=False, semseg=False):
+    """Resume completed stages; refuse stale outputs after an input/prompt change."""
+    original = load_rgb(path)
+    key = output_key(path, input_dir)
+    folders = {name: output_dir / name / key for name in
+               ("masks", "generated", "patches", "overlay", "evening", "semseg")}
+    manifest_path = output_dir / "metadata" / key.with_suffix(".json")
+    identity = {"source": key.as_posix(),
+        "source_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "model": config.MODEL, "image_size": "1K", "processing_version": 1,
+        "mask_prompt": config.MASK_PROMPT, "patch_prompt": config.PATCH_PROMPT,
+        "evening_prompt": config.EVENING_PROMPT, "semseg_prompt": config.SEMSEG_PROMPT}
+    if manifest_path.exists():
+        if json.loads(manifest_path.read_text(encoding="utf-8")) != identity:
+            raise ValueError(f"Input or settings changed for {path.name}. Use a new --output directory.")
+    elif any(p.exists() for p in folders.values()):
+        raise ValueError(f"Outputs without provenance for {path.name}. Use a new --output directory.")
+    else:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(identity, indent=2, ensure_ascii=False), encoding="utf-8")
+    if not folders["masks"].exists():
+        mask = binarize_mask(generate_image(config.MASK_PROMPT, [original]), original.size)
+        if not np.any(np.asarray(mask)):
+            raise ValueError(f"Empty patch mask for {path.name}; inspect the input before retrying.")
+        save_image(mask, folders["masks"])
+    with Image.open(folders["masks"]) as image:
+        mask = binarize_mask(image, original.size)
+    if not folders["generated"].exists():
+        generated = ensure_size(generate_image(config.PATCH_PROMPT, [original, mask.convert("RGB")]), original.size)
+        save_image(generated, folders["generated"])
+    if not folders["patches"].exists():
+        save_image(composite_patch(original, load_rgb(folders["generated"]), mask), folders["patches"])
+    patched = load_rgb(folders["patches"])
+    if not folders["overlay"].exists():
+        save_image(overlay_mask_on_image(patched, mask), folders["overlay"])
+    if evening and not folders["evening"].exists():
+        save_image(ensure_size(generate_image(config.EVENING_PROMPT, [patched]), original.size), folders["evening"])
+    if semseg and not folders["semseg"].exists():
+        save_image(quantize_to_palette(generate_image(config.SEMSEG_PROMPT, [original]), original.size), folders["semseg"])
+    return folders
 
 
 def main():
-    assert GEMINI_API_KEY, "Set GEMINI_API_KEY in config.py"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, default=Path(config.INPUT_DIR))
+    parser.add_argument("--output", type=Path, default=Path("outputs"))
+    parser.add_argument("--evening", action="store_true", help="One additional generation per input")
+    parser.add_argument("--semseg", action="store_true", help="One additional experimental segmentation per input")
+    parser.add_argument("--limit", type=int, help="Process at most this many input images")
+    parser.add_argument("--dry-run", action="store_true", help="List inputs and maximum generation count; no API calls")
+    args = parser.parse_args()
+    if args.limit is not None and args.limit <= 0:
+        parser.error("--limit must be positive")
+    args.input, args.output = args.input.resolve(), args.output.resolve()
+    try:
+        paths = discover_inputs(args.input, args.output)
+    except ValueError as error:
+        parser.error(str(error))
+    paths = paths[:args.limit]
+    if args.dry_run:
+        for path in paths:
+            print(path.relative_to(args.input))
+        print(f"At most {len(paths) * (2 + args.evening + args.semseg)} image generations; existing stages are reused.")
+        return
+    if not config.GEMINI_API_KEY:
+        parser.error("Set the GEMINI_API_KEY environment variable before generating images.")
+    from google import genai
+    from google.genai import types
+    from tqdm.auto import tqdm
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    def request_image(prompt, images):
+        response = client.models.generate_content(
+            model=config.MODEL, contents=[prompt, *images],
+            config=types.GenerateContentConfig(response_modalities=["TEXT", "IMAGE"],
+                                                image_config=types.ImageConfig(image_size="1K")))
+        return response_last_image_as_pil(response)
 
-    in_dir = Path(INPUT_DIR)
-
-    script_dir = Path(__file__).resolve().parent
-
-    masks_dir = script_dir / OUT_MASKS_NAME
-    patched_dir = script_dir / OUT_PATCHED_NAME
-    evening_dir = script_dir / OUT_EVENING_NAME
-    overlay_dir = script_dir / OUT_OVERLAY_NAME
-    semseg_dir = script_dir / OUT_SEMSEG_NAME
-
-    masks_dir.mkdir(parents=True, exist_ok=True)
-    patched_dir.mkdir(parents=True, exist_ok=True)
-    evening_dir.mkdir(parents=True, exist_ok=True)
-    overlay_dir.mkdir(parents=True, exist_ok=True)
-    semseg_dir.mkdir(parents=True, exist_ok=True)
-
-    paths = [p for p in sorted(in_dir.glob("**/*")) if p.is_file() and p.suffix.lower() in EXTS]
-    assert paths, f"No images found in {INPUT_DIR}"
-
-    for p in tqdm(paths, desc="Processing"):
-        stem = p.stem
-
-        out_mask_path = masks_dir / f"{stem}.png"
-        out_patched_path = patched_dir / f"{stem}.png"
-        out_evening_path = evening_dir / f"{stem}.png"
-        out_overlay_path = overlay_dir / f"{stem}.png"
-        out_semseg_path = semseg_dir / f"{stem}.png"
-
-        if (
-            out_mask_path.exists()
-            and out_patched_path.exists()
-            and out_evening_path.exists()
-            and out_overlay_path.exists()
-            and out_semseg_path.exists()
-        ):
-            continue
-
-        orig = to_rgb(PILImage.open(p))
-        W, H = orig.size
-
-        # semseg mask
-        if not out_semseg_path.exists():
-            resp = client.models.generate_content(
-                model=MODEL,
-                contents=[SEMSEG_PROMPT, orig],
-            )
-            raw_sem = response_last_image_as_pil(resp)
-            sem = quantize_to_palette(raw_sem, (W, H))
-            sem.save(out_semseg_path)
-
-        # patch mask
-        if not out_mask_path.exists():
-            resp = client.models.generate_content(
-                model=MODEL,
-                contents=[MASK_PROMPT, orig],
-            )
-            raw_mask = response_last_image_as_pil(resp)
-            mask_l = binarize_mask(raw_mask, (W, H))
-            mask_l.save(out_mask_path)
-        else:
-            mask_l = binarize_mask(PILImage.open(out_mask_path), (W, H))
-
-        # patches
-        if not out_patched_path.exists():
-            mask_rgb = mask_l.convert("RGB")
-            resp = client.models.generate_content(
-                model=MODEL,
-                contents=[PATCH_PROMPT, orig, mask_rgb],
-            )
-            patched = ensure_size(to_rgb(response_last_image_as_pil(resp)), (W, H))
-            patched.save(out_patched_path)
-
-        # overlay
-        if not out_overlay_path.exists():
-            patched_img = to_rgb(PILImage.open(out_patched_path))
-            overlay = overlay_mask_on_image(patched_img, mask_l, color=(255, 0, 0), alpha=0.35)
-            overlay.save(out_overlay_path)
-
-        # evening
-        if not out_evening_path.exists():
-            patched_img = to_rgb(PILImage.open(out_patched_path))
-            resp = client.models.generate_content(
-                model=MODEL,
-                contents=[EVENING_PROMPT, patched_img],
-            )
-            evening = ensure_size(to_rgb(response_last_image_as_pil(resp)), (W, H))
-            evening.save(out_evening_path)
-
-    print("Done.")
-    print("Masks:   ", str(masks_dir))
-    print("Patched: ", str(patched_dir))
-    print("Overlay: ", str(overlay_dir))
-    print("SemSeg:  ", str(semseg_dir))
-    print("Evening: ", str(evening_dir))
+    with genai.Client(api_key=config.GEMINI_API_KEY) as client:
+        for path in tqdm(paths, desc="Processing"):
+            process_image(path, args.input, args.output, request_image,
+                          evening=args.evening, semseg=args.semseg)
+    print(f"Saved to {args.output}. Review masks, alignment and seams before training.")
 
 
 if __name__ == "__main__":

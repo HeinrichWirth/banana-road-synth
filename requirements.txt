@@ -1,4 +1,4 @@
-google-genai
-numpy
-Pillow
-tqdm
+google-genai>=2.33,<3
+numpy>=1.26,<3
+Pillow>=10,<13
+tqdm>=4.66,<5

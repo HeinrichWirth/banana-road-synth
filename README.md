@@ -1,129 +1,112 @@
-# Banana-road-synth
+# Banana Road Synth
 
-![logo](assets/logo.jpeg)
+**English** | [Русский](README.ru.md)
 
-Minimal Python pipeline for generating synthetic road defects
-(patches, potholes, lighting conditions) on top of real road images
-using Gemini image models.
+Generate synthetic asphalt repair patches on real road photographs with **Nano Banana Pro**. The pipeline first proposes a binary mask, then asks the model to render worn patches in those locations. It saves the model output, a background-preserving composite and a mask overlay for review.
 
-The goal is fast dataset expansion for computer vision experiments
-when real labeled data is scarce or domain-specific.
+[Russian article](https://habr.com/ru/articles/993968/) · [Google image-generation guide](https://ai.google.dev/gemini-api/docs/generate-content/image-generation) · [API pricing](https://ai.google.dev/gemini-api/docs/pricing)
 
----
+## A real scene, synthetic patches
 
-## What this repository contains
+| Original | Generated | Mask overlay |
+| --- | --- | --- |
+| ![Original road](assets/before_1.png) | ![Generated repair patches](assets/after_1.png) | ![Mask over generated patches](assets/overlay_1.png) |
+| ![Second original road](assets/before_2.png) | ![Second generated example](assets/after_2.png) | ![Second mask overlay](assets/overlay_2.png) |
+| ![Third original road](assets/before_3.png) | ![Third generated example](assets/after_3.png) | ![Third mask overlay](assets/overlay_3.png) |
 
-A single script that processes a folder of road images and produces:
+These are the original experiment's examples, not new API runs. The current script additionally composites generated pixels inside the binary mask; the examples above predate that step.
 
-- synthetic asphalt repair patches using generated binary masks
-- corresponding masks (usable as labels)
-- visual overlays for sanity check
-- optional lighting change (evening)
+## Quick start
 
-The pipeline is intentionally simple and explicit.
-
----
-
-## What this is **not**
-
-- Not a full dataset generation framework
-- Not a training pipeline
-- Not a replacement for real data
-- Not a general-purpose segmentation solution
-
-This is a **data generation utility**, nothing more.
-
----
-
-## Requirements
-
-- Python 3.9+
-- Gemini API access
-
-Install dependencies:
+Python **3.10+** and Gemini API access with image generation enabled are required. Requests are billable; the offline checks do not call the API.
 
 ```bash
-pip install -r requirements.txt
+git clone https://github.com/HeinrichWirth/banana-road-synth.git
+cd banana-road-synth
+python -m venv .venv
 ```
 
----
-
-## Configuration
-
-All configuration is located in `config.py`:
-
-- `GEMINI_API_KEY` – your API key
-- `MODEL` – Gemini image model name
-- `INPUT_DIR` – absolute path to input images
-- output directory names
-- all prompts used by the pipeline
-
-Only `INPUT_DIR` must be changed to run the script.
-
----
-
-## Usage
+Activate the environment with `source .venv/bin/activate` on macOS/Linux, or `.venv\Scripts\Activate.ps1` in Windows PowerShell, then install:
 
 ```bash
-python generate.py
+python -m pip install -r requirements.txt
 ```
 
-The script will:
+Set `GEMINI_API_KEY` in your environment. For example, in macOS/Linux:
 
-1. Scan `INPUT_DIR` recursively for images
-2. Generate outputs for each image
-3. Skip files that were already processed
-4. Save results into output folders next to the script
+```bash
+export GEMINI_API_KEY="your-api-key"
+```
 
----
+Or in PowerShell:
 
-## Output structure
+```powershell
+$env:GEMINI_API_KEY = "your-api-key"
+```
+
+Keep the real key out of source files and commits. The script does not load `.env` files automatically.
+
+Preview the inputs without sending anything to Google:
+
+```bash
+python generate.py --input ./input_images --output ./outputs --limit 1 --dry-run
+```
+
+Generate one candidate pair:
+
+```bash
+python generate.py --input ./input_images --output ./outputs --limit 1
+```
+
+Remove `--limit 1` to process the folder recursively. Use `--evening` and/or `--semseg` to enable the additional experiments. Each enabled option adds one image-generation request per new input.
+
+## Processing
+
+1. Load the photograph as RGB and apply its EXIF orientation.
+2. Ask for a repair-patch mask; resize with nearest-neighbour interpolation and threshold at **128** to obtain values **0/255**.
+3. Send the photograph and mask to the model to generate patches.
+4. Resize the generated image to the source dimensions if necessary and save it in `generated/` for inspection.
+5. Copy generated pixels inside the mask and original pixels outside it into `patches/`. Save as lossless PNG.
+6. Produce a red overlay locally, with opacity **0.35**.
+7. Optionally generate dusk lighting or an experimental semantic mask.
+
+Compositing guarantees that decoded RGB pixels outside the mask stay unchanged in `patches/`. It does **not** guarantee that the model filled every masked pixel correctly: check patch boundaries, geometry and seams before treating the mask as a training label. The dusk output deliberately edits the whole image.
+
+The semantic palette is black for background, blue for curbs, green for lane markings, red for crosswalks and white for signs. Colours are snapped to the nearest palette colour in RGB space. This standardises encoding, not semantic accuracy.
+
+## Configuration and outputs
+
+Prompts and defaults live in [`config.py`](config.py). `GEMINI_MODEL` overrides the model; the default is `gemini-3-pro-image`. The February 2026 experiment used `gemini-3-pro-image-preview`. Image output size is explicitly requested as **1K**; the final saved dimensions match the input. Resizing cannot restore detail absent from the generated output.
 
 ```text
-banana-road-synth/
-├── generate.py
-├── config.py
-├── requirements.txt
-├── out_masks/        # binary masks (labels)
-├── out_patches/      # images with synthetic patches
-├── out_overlay/      # visualization overlays
-├── out_evening/      # lighting-modified images
-└── out_semseg/       # experimental semantic segmentation
+outputs/
+├── masks/       # proposed binary masks
+├── generated/   # model output, resized to input dimensions
+├── patches/     # composite retaining the original background
+├── overlay/     # local visual check
+├── metadata/    # source hash, model and prompts for resuming
+├── evening/     # optional whole-scene relighting
+└── semseg/      # optional experimental segmentation
 ```
 
----
+Input `route_a/frame.jpg` becomes `route_a/frame.jpg.png` in each image folder. Keeping the relative directory and original extension avoids collisions with `route_b/frame.jpg` and `route_a/frame.png`.
 
-## Notes on semantic segmentation
+Completed stages are reused. A changed source, model or prompt requires a **new output directory**, preventing a mixture of incompatible cached stages. If you manually edit cached outputs, also start a new output directory. Keep one process per output directory. A failed API stage stops the run; rerun after resolving the error. Missing images in API responses produce a clear error, not an empty label. Empty generated masks are rejected before the patch request.
 
-Semantic segmentation included in this pipeline is **experimental**.
+## Cost
 
-The model may:
-- confuse curbs, barriers, and parapets
-- hallucinate traffic signs
-- misinterpret shadows
+At the standard Pro rate used in the article, one 1K/2K output is **1,120 × $120 / 1,000,000 = $0.1344**. The basic two-request pipeline therefore costs **$0.2688 in image output**, before input, text/thinking output and retries. Both optional experiments increase that to **$0.5376** per source image. Local compositing and overlays make no API calls. Check [current prices](https://ai.google.dev/gemini-api/docs/pricing) before a run.
 
----
+The dry run reports an upper bound on generation count, not a billing quote. This repository does not measure downstream model accuracy; evaluate synthetic-data training on held-out real images.
 
-## Examples
-### Before
-![before_1](assets/before_1.png)
-![before_2](assets/before_2.png)
-![before_3](assets/before_3.png)
+## Offline checks
 
-### After
-![after_1](assets/after_1.png)
-![after_2](assets/after_2.png)
-![after_3](assets/after_3.png)
+```bash
+python -m unittest discover -s tests -v
+```
 
-### Overlay masks
-![overlay_1](assets/overlay_1.png)
-![overlay_2](assets/overlay_2.png)
-![overlay_3](assets/overlay_3.png)
-
----
+Tests cover mask thresholding, palette assignment, exact background preservation, missing responses, output naming, stage resumption and optional request counts. They use deterministic local fixtures; they do not measure model quality or spend API credits.
 
 ## License
 
-MIT
-
----
+[MIT](LICENSE).
